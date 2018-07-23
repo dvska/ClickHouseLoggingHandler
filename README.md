@@ -6,9 +6,10 @@
 ```sql
  CREATE TABLE IF NOT EXISTS Log(
     ts       DateTime DEFAULT now(),
+    msec     UInt32,
     node     String,
     uid      UInt32 DEFAULT toUInt32(0),
-    jobid    UInt16,
+    jobid    UInt32,
     plug     String DEFAULT '',
     level    Enum8('💥💥💥CRITICAL'=50, '⛑ERROR'=40, '🚸WARNING'=30, '💚INFO'=20, '🖤DEBUG'=10, 'NOTSET'=0),
     type     Enum8('monitor'=1, 'widget'=2, ''=0),
@@ -20,7 +21,9 @@
     )
     ENGINE = MergeTree()
     PARTITION BY (toYYYYMM(ts), node)
-    ORDER BY (ts, node, uid)
+    ORDER BY (ts, node, uid);
+CREATE TABLE Log_buffer AS Log ENGINE = Buffer(default, Log, 16, 10, 120, 10000, 100000, 1000000, 1000000)
+    
 ```
 
 
@@ -39,6 +42,11 @@ except Exception as e:
     
 clickh_handler = clickhouse_logging_handler.ClickHouseLoggingHandler(CLICKHOUSE_URL)
 logging.getLogger().addHandler(clickh_handler)
+
+def main():
+    log = logging.getLogger()
+
+    log.debug('some debug output')
+    log.critical('time to die', extra=dict(force_flush=True))  # forcibly send to ClHouse
 ```
 
-P.S. Use something like https://github.com/nikepan/clickhouse-bulk or Buffer-engine table in real life.

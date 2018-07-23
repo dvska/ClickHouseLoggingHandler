@@ -4,9 +4,12 @@
     Python logging tuned to Я.ЩёлкнитеДом
 
 """
+import json
 import logging
 import os
+import socket
 import sys
+import time
 import traceback
 from datetime import datetime
 
@@ -44,9 +47,15 @@ def extract_extra(record, reserved=RESERVED, contextual=CONTEXTUAL):
 
 
 class ClickHouseLoggingHandler(logging.Handler):
+    BUFFER_SIZE = 1000  # records  # TODO into config
+    BUFFER_FLUSHTIME = 20  # secs
+
+    last_flushed = time.time()
+
     def __init__(self, url, **kwargs):
         self.extra = kwargs.get('extra', {})
         self.url = url
+        self.buffer = []
         logging.Handler.__init__(self, level=kwargs.get('level', logging.NOTSET))
 
     def emit(self, record):
@@ -54,17 +63,18 @@ class ClickHouseLoggingHandler(logging.Handler):
             self.format(record)
             return self._emit(record)
         except Exception:
-            print("Top level ClickHouse exception caught - failed creating log record", file=sys.stderr)
+            print(f"Top level ClickHouse exception caught - failed creating log record @ {self.url}", file=sys.stderr)
             print(str(record.msg), file=sys.stderr)
-            print(str(traceback.format_exc()), file=sys.stderr)
-            sys.exit(5)
+            print(traceback.format_exc(), file=sys.stderr)
+            time.sleep(5)
 
     def _emit(self, record):
         data, extra = extract_extra(record)
 
-        date = datetime.utcfromtimestamp(record.created)
+        date = str(datetime.utcfromtimestamp(record.created))
 
-        data['ts'] = str(date)[:-7]
+        data['ts'] = date[:-7]
+        data['msec'] = date[-6:]
         data['level'] = record.levelname
         data['logger'] = record.name
         data['pid'] = extra['process']
@@ -77,24 +87,35 @@ class ClickHouseLoggingHandler(logging.Handler):
         data['type'] = os.environ.get('theapp_job_type', '')
         data['plug'] = os.environ.get('theapp_plug_action', '')
 
-        logging.getLogger('clickhouse_driver.connection').setLevel(logging.CRITICAL)
-
-        logging.getLogger("requests").setLevel(logging.ERROR)
-        logging.getLogger("urllib3").setLevel(logging.ERROR)
-
         # requests.post(f'{self.url}?query=Insert+into+Log+FORMAT+JSONEachRow&input_format_skip_unknown_fields=1', json=data)
 
         #  instead, use sockets   1) for speed and  2) because requests use logging itself
-        import socket, json
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        url = self.url.split('//')[1]
-        host, port = url.split(':')
-        s.connect((host, int(port)))
-        json_data = json.dumps(data, separators=(',', ':'))
-        s.send(bytes(
-            "POST /?query=Insert+into+Log+FORMAT+JSONEachRow&input_format_skip_unknown_fields=1 HTTP/1.1\r\n"
-            f"Host: {host}\r\n"
-            f"Content-Length: {len(json_data)}\r\nConnection: keep-alive\r\nContent-Type: application/json\r\n\r\n{json_data}\r\n", 'utf8'))
-        # response = s.recv(4096)
-        # print(response)
+
+        if extra.get('force_flush') or (time.time() - self.last_flushed > self.BUFFER_FLUSHTIME
+                            or len(self.buffer) >= self.BUFFER_SIZE
+                            or record.levelno > logging.ERROR):
+            json_bulk_data = '\n'.join(self.buffer) + '\n'
+
+            try:
+                # requests.post(f'{self.url}?query=Insert+into+Log+FORMAT+JSONEachRow&input_format_skip_unknown_fields=1', json=data)
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                url = self.url.split('//')[1]
+                host, port = url.split(':')
+                s.connect((host, int(port)))
+                s.send(bytes(
+                    "POST /?query=Insert+into+Log_buffer+FORMAT+JSONEachRow&input_format_skip_unknown_fields=1 HTTP/1.1\r\n"
+                    f"Host: {host}\r\n"
+                    f"Content-Length: {len(json_bulk_data)}\r\nConnection: keep-alive\r\nContent-Type: application/json\r\n\r\n{json_bulk_data}\r\n", 'utf8'))
+                # response = s.recv(4096);
+                # print(response.decode('utf8'))
+                # if b'400 Bad Request' in response:
+                #     print(json_data)
+                # s.close()
+            except:
+                with open('log_records_unsent_to_clickhouse.JSONEachRow', 'a') as json_log:
+                    json_log.write(json_bulk_data + '\n')
+                    raise
+            finally:
+                self.buffer = []
+                self.last_flushed = time.time()
